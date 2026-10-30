@@ -158,6 +158,21 @@ export async function runNonInteractivePrompt(input: Input) {
     return result
   }
 
+  // Only this session's own jobs hold the run open. A subagent reports back through its job here, so
+  // work it leaves behind, such as a dev server it tested against, never keeps the run alive.
+  const pendingBackground = async () => {
+    if (input.compatibility === "v1" || interrupted || permissionRejected || formCancelled || emittedError) return false
+    const jobs = await input.client.experimental.job.list({ sessionID: input.sessionID }).catch(() => [])
+    if (jobs.length > 0) return true
+    // A finished job wakes this session before its row is removed, so a wake that raced the
+    // list above shows up as an active session or a queued inbox item.
+    const [active, inbox] = await Promise.all([
+      input.client.session.active().catch(() => ({})),
+      input.client.session.inbox.list({ sessionID: input.sessionID }).catch(() => []),
+    ])
+    return input.sessionID in active || inbox.length > 0
+  }
+
   const replyPermission = async (request: {
     id: string
     sessionID: string
@@ -210,13 +225,17 @@ export async function runNonInteractivePrompt(input: Input) {
   }
 
   const consume = async () => {
+    const aborted = new Promise<{ done: true; value: undefined }>((resolve) => {
+      if (controller.signal.aborted) resolve({ done: true, value: undefined })
+      else controller.signal.addEventListener("abort", () => resolve({ done: true, value: undefined }), { once: true })
+    })
     while (!controller.signal.aborted) {
-      const next = await stream.next().catch((error) => {
-        if (!emittedError) throw error
+      const next = await Promise.race([stream.next(), aborted]).catch((error) => {
+        if (!emittedError && !interrupted) throw error
         return { done: true as const, value: undefined }
       })
       if (next.done) {
-        if (emittedError) return
+        if (emittedError || interrupted) return
         throw new Error("Event stream disconnected during prompt execution")
       }
       const event = next.value
@@ -546,7 +565,10 @@ export async function runNonInteractivePrompt(input: Input) {
         }
         return
       }
-      if (event.type === "session.execution.succeeded") return
+      if (event.type === "session.execution.succeeded") {
+        if (await pendingBackground()) continue
+        return
+      }
     }
   }
 
@@ -711,7 +733,14 @@ export async function runNonInteractivePrompt(input: Input) {
     interrupted = true
     process.exitCode = 130
     admission?.abort()
-    void input.client.session.interrupt({ sessionID: input.sessionID }).catch(() => {})
+    void input.client.session
+      .interrupt({ sessionID: input.sessionID })
+      .then((result) => {
+        if (!result.interrupted) controller.abort()
+      })
+      .catch(() => {
+        controller.abort()
+      })
   }
   process.on("SIGINT", interrupt)
 
@@ -790,7 +819,15 @@ export async function runNonInteractivePrompt(input: Input) {
       return
     }
 
-    const waiting = input.client.experimental.session.wait({ sessionID: input.sessionID })
+    const waitUntilIdle = async () => {
+      await input.client.experimental.session.wait({ sessionID: input.sessionID })
+      if (!(await pendingBackground())) return
+      await completed
+      if (!interrupted && !permissionRejected && !formCancelled && !emittedError) {
+        await input.client.experimental.session.wait({ sessionID: input.sessionID })
+      }
+    }
+    const waiting = waitUntilIdle()
     await Promise.race([waiting, completed.then(() => waiting)])
     finalizing = true
     const projected = await reconcile()
